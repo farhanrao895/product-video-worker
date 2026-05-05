@@ -1,3 +1,6 @@
+
+WORKER_VERSION = "video-generation-r2-v2"
+print(f"Starting worker version: {WORKER_VERSION}")
 import os
 import uuid
 import shutil
