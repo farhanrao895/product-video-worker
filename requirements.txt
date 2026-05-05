@@ -1,3 +1,15 @@
 runpod
 requests
 huggingface_hub
+hf_transfer
+boto3
+pillow
+diffusers
+transformers
+accelerate
+safetensors
+sentencepiece
+protobuf
+imageio
+imageio-ffmpeg
+numpy
