@@ -6,7 +6,7 @@ import shutil
 import traceback
 from urllib.parse import urlparse, unquote
 
-WORKER_VERSION = "video-generation-r2-v3-diagnostics"
+WORKER_VERSION = "video-generation-r2-v4-quality"
 print("BOOT: handler.py starting", flush=True)
 print(f"BOOT: worker version: {WORKER_VERSION}", flush=True)
 
@@ -31,8 +31,9 @@ S3_BUCKET = os.environ.get("S3_BUCKET")
 S3_PUBLIC_BASE_URL = os.environ.get("S3_PUBLIC_BASE_URL")
 
 DEFAULT_FPS = int(os.environ.get("VIDEO_FPS", "24"))
-DEFAULT_STEPS = int(os.environ.get("LTX_STEPS", "30"))
-HIGH_QUALITY_STEPS = int(os.environ.get("LTX_HIGH_QUALITY_STEPS", "45"))
+DEFAULT_STEPS = int(os.environ.get("LTX_STEPS", "50"))
+HIGH_QUALITY_STEPS = int(os.environ.get("LTX_HIGH_QUALITY_STEPS", "60"))
+MAX_VIDEO_FRAMES = int(os.environ.get("MAX_VIDEO_FRAMES", "361"))
 
 PIPE = None
 
@@ -62,10 +63,7 @@ def get_s3_client():
         region_name=S3_REGION,
         aws_access_key_id=S3_ACCESS_KEY,
         aws_secret_access_key=S3_SECRET_KEY,
-        config=Config(
-            signature_version="s3v4",
-            s3={"addressing_style": "path"},
-        ),
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
 
 
@@ -77,12 +75,7 @@ def upload_file_to_r2(local_path: str, key: str, content_type: str = "video/mp4"
     s3 = get_s3_client()
 
     with open(local_path, "rb") as f:
-        s3.put_object(
-            Bucket=S3_BUCKET,
-            Key=key,
-            Body=f,
-            ContentType=content_type,
-        )
+        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=f, ContentType=content_type)
 
     return public_url_for_key(key)
 
@@ -114,17 +107,25 @@ def output_key_for(user_id: str, job_id: str) -> str:
     return f"outputs/{user_id}/{job_id}/final.mp4"
 
 
-def dimensions_for(aspect_ratio: str):
+def dimensions_for(aspect_ratio: str, quality: str = "standard"):
+    if quality == "high":
+        if aspect_ratio == "9:16":
+            return 768, 1344
+        if aspect_ratio == "1:1":
+            return 1024, 1024
+        return 1344, 768
+
     if aspect_ratio == "9:16":
-        return 480, 704
+        return 576, 1024
     if aspect_ratio == "1:1":
-        return 512, 512
-    return 704, 480
+        return 768, 768
+    return 1024, 576
 
 
 def frame_count_for(duration: int, fps: int):
-    target = max(49, min(int(duration) * fps, 121))
-    return target - ((target - 1) % 8)
+    target = int(duration) * fps + 1
+    capped = min(target, MAX_VIDEO_FRAMES)
+    return capped - ((capped - 1) % 8)
 
 
 def normalize_image(input_path: str, output_path: str, width: int, height: int):
@@ -180,7 +181,7 @@ def generate_video(prompt: str, image, output_path: str, duration: int, aspect_r
     import torch
     from diffusers.utils import export_to_video
 
-    width, height = dimensions_for(aspect_ratio)
+    width, height = dimensions_for(aspect_ratio, quality)
     fps = DEFAULT_FPS
     num_frames = frame_count_for(duration, fps)
     steps = HIGH_QUALITY_STEPS if quality == "high" else DEFAULT_STEPS
@@ -188,7 +189,7 @@ def generate_video(prompt: str, image, output_path: str, duration: int, aspect_r
     negative_prompt = (
         "worst quality, low quality, blurry, jittery, distorted, deformed, "
         "duplicated product, duplicated bottle, extra text, watermark, logo errors, "
-        "inconsistent label, bad reflections, flicker, warped geometry"
+        "inconsistent label, bad reflections, flicker, warped geometry, compression artifacts"
     )
 
     pipe = get_pipeline()
@@ -197,7 +198,10 @@ def generate_video(prompt: str, image, output_path: str, duration: int, aspect_r
         int.from_bytes(os.urandom(4), "big")
     )
 
-    log(f"Generating video: {width}x{height}, frames={num_frames}, fps={fps}, steps={steps}")
+    log(
+        f"Generating video: {width}x{height}, frames={num_frames}, "
+        f"duration_requested={duration}s, fps={fps}, steps={steps}, quality={quality}"
+    )
 
     with torch.inference_mode():
         result = pipe(
@@ -208,8 +212,10 @@ def generate_video(prompt: str, image, output_path: str, duration: int, aspect_r
             height=height,
             num_frames=num_frames,
             num_inference_steps=steps,
+            guidance_scale=5.0 if quality == "high" else 3.5,
+            image_cond_noise_scale=0.025,
             generator=generator,
-            decode_timestep=0.03,
+            decode_timestep=0.05 if quality == "high" else 0.03,
             decode_noise_scale=0.025,
         )
 
@@ -250,7 +256,7 @@ def handler(job):
 
         download_file(image_url, raw_image_path)
 
-        width, height = dimensions_for(aspect_ratio)
+        width, height = dimensions_for(aspect_ratio, quality)
         image = normalize_image(raw_image_path, image_path, width, height)
 
         generate_video(prompt, image, output_path, duration, aspect_ratio, quality)
@@ -269,6 +275,10 @@ def handler(job):
             "video_url": video_url,
             "output_key": output_key,
             "model_repo": MODEL_REPO,
+            "duration_requested": duration,
+            "frames": frame_count_for(duration, DEFAULT_FPS),
+            "fps": DEFAULT_FPS,
+            "quality": quality,
         }
 
     except Exception as e:
