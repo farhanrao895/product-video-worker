@@ -1,18 +1,22 @@
-
-WORKER_VERSION = "video-generation-r2-v2"
-print(f"Starting worker version: {WORKER_VERSION}")
 import os
+import sys
+import time
 import uuid
 import shutil
+import traceback
 from urllib.parse import urlparse, unquote
 
-import boto3
-import requests
-import runpod
-import torch
-from PIL import Image
-from diffusers import LTXImageToVideoPipeline
-from diffusers.utils import export_to_video
+WORKER_VERSION = "video-generation-r2-v3-diagnostics"
+print("BOOT: handler.py starting", flush=True)
+print(f"BOOT: worker version: {WORKER_VERSION}", flush=True)
+
+try:
+    import runpod
+except Exception:
+    print("BOOT_FATAL: failed to import runpod", flush=True)
+    traceback.print_exc()
+    time.sleep(30)
+    sys.exit(1)
 
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -33,12 +37,19 @@ HIGH_QUALITY_STEPS = int(os.environ.get("LTX_HIGH_QUALITY_STEPS", "45"))
 PIPE = None
 
 
+def log(message: str):
+    print(message, flush=True)
+
+
 def require_env(name: str, value: str | None):
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
 
 
 def get_s3_client():
+    import boto3
+    from botocore.config import Config
+
     require_env("S3_ENDPOINT", S3_ENDPOINT)
     require_env("S3_ACCESS_KEY", S3_ACCESS_KEY)
     require_env("S3_SECRET_KEY", S3_SECRET_KEY)
@@ -51,6 +62,10 @@ def get_s3_client():
         region_name=S3_REGION,
         aws_access_key_id=S3_ACCESS_KEY,
         aws_secret_access_key=S3_SECRET_KEY,
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+        ),
     )
 
 
@@ -73,6 +88,8 @@ def upload_file_to_r2(local_path: str, key: str, content_type: str = "video/mp4"
 
 
 def download_file(url: str, output_path: str) -> str:
+    import requests
+
     with requests.get(url, stream=True, timeout=300) as response:
         response.raise_for_status()
         with open(output_path, "wb") as f:
@@ -84,13 +101,6 @@ def download_file(url: str, output_path: str) -> str:
 
 
 def extract_user_job_from_image_url(image_url: str, fallback_job_id: str):
-    """
-    Expected R2 key:
-    uploads/{userId}/{jobId}/{timestamp}-{filename}
-
-    Public URL:
-    https://pub-xxx.r2.dev/uploads/{userId}/{jobId}/{filename}
-    """
     path = unquote(urlparse(image_url).path).lstrip("/")
     parts = path.split("/")
 
@@ -105,7 +115,6 @@ def output_key_for(user_id: str, job_id: str) -> str:
 
 
 def dimensions_for(aspect_ratio: str):
-    # Keep these modest for first production test. They are multiples of 32.
     if aspect_ratio == "9:16":
         return 480, 704
     if aspect_ratio == "1:1":
@@ -113,7 +122,14 @@ def dimensions_for(aspect_ratio: str):
     return 704, 480
 
 
+def frame_count_for(duration: int, fps: int):
+    target = max(49, min(int(duration) * fps, 121))
+    return target - ((target - 1) % 8)
+
+
 def normalize_image(input_path: str, output_path: str, width: int, height: int):
+    from PIL import Image
+
     image = Image.open(input_path).convert("RGB")
     image.thumbnail((width, height), Image.Resampling.LANCZOS)
 
@@ -132,7 +148,17 @@ def get_pipeline():
     if PIPE is not None:
         return PIPE
 
-    print(f"Loading LTX pipeline from {MODEL_REPO}")
+    import torch
+    import diffusers
+    from diffusers import LTXImageToVideoPipeline
+
+    log(f"BOOT: diffusers={diffusers.__version__}")
+    log(f"BOOT: torch={torch.__version__}, cuda={torch.version.cuda}, available={torch.cuda.is_available()}")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available inside the RunPod worker")
+
+    log(f"Loading LTX pipeline from {MODEL_REPO}")
 
     PIPE = LTXImageToVideoPipeline.from_pretrained(
         MODEL_REPO,
@@ -146,25 +172,17 @@ def get_pipeline():
     if hasattr(PIPE, "vae") and hasattr(PIPE.vae, "enable_tiling"):
         PIPE.vae.enable_tiling()
 
-    print("LTX pipeline loaded")
+    log("LTX pipeline loaded")
     return PIPE
 
 
-def generate_video(
-    prompt: str,
-    image: Image.Image,
-    output_path: str,
-    duration: int,
-    aspect_ratio: str,
-    quality: str,
-):
+def generate_video(prompt: str, image, output_path: str, duration: int, aspect_ratio: str, quality: str):
+    import torch
+    from diffusers.utils import export_to_video
+
     width, height = dimensions_for(aspect_ratio)
     fps = DEFAULT_FPS
-
-    # LTX examples commonly use 161 frames. For faster first production tests,
-    # use duration * fps, capped to avoid huge first runs.
-    num_frames = max(49, min(int(duration) * fps, 121))
-
+    num_frames = frame_count_for(duration, fps)
     steps = HIGH_QUALITY_STEPS if quality == "high" else DEFAULT_STEPS
 
     negative_prompt = (
@@ -179,10 +197,7 @@ def generate_video(
         int.from_bytes(os.urandom(4), "big")
     )
 
-    print(
-        f"Generating video: {width}x{height}, frames={num_frames}, "
-        f"fps={fps}, steps={steps}, quality={quality}"
-    )
+    log(f"Generating video: {width}x{height}, frames={num_frames}, fps={fps}, steps={steps}")
 
     with torch.inference_mode():
         result = pipe(
@@ -198,8 +213,7 @@ def generate_video(
             decode_noise_scale=0.025,
         )
 
-    frames = result.frames[0]
-    export_to_video(frames, output_path, fps=fps)
+    export_to_video(result.frames[0], output_path, fps=fps)
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -231,57 +245,40 @@ def handler(job):
     output_path = os.path.join(work_dir, "final.mp4")
 
     try:
-        print(f"Job started: {job_id}")
-        print(f"Downloading image: {image_url}")
+        log(f"Job started: {job_id}")
+        log(f"Downloading image: {image_url}")
 
         download_file(image_url, raw_image_path)
 
         width, height = dimensions_for(aspect_ratio)
         image = normalize_image(raw_image_path, image_path, width, height)
 
-        generate_video(
-            prompt=prompt,
-            image=image,
-            output_path=output_path,
-            duration=duration,
-            aspect_ratio=aspect_ratio,
-            quality=quality,
-        )
+        generate_video(prompt, image, output_path, duration, aspect_ratio, quality)
 
         user_id, resolved_job_id = extract_user_job_from_image_url(image_url, job_id)
-        final_job_id = job_id or resolved_job_id
-        output_key = output_key_for(user_id, final_job_id)
+        output_key = output_key_for(user_id, resolved_job_id)
 
-        print(f"Uploading video to R2: {output_key}")
+        log(f"Uploading video to R2: {output_key}")
         video_url = upload_file_to_r2(output_path, output_key)
 
-        print(f"Job completed: {job_id}")
-        print(f"Video URL: {video_url}")
+        log(f"Job completed: {job_id}")
+        log(f"Video URL: {video_url}")
 
         return {
             "success": True,
             "video_url": video_url,
             "output_key": output_key,
             "model_repo": MODEL_REPO,
-            "received": {
-                "prompt": prompt,
-                "image_url": image_url,
-                "duration": duration,
-                "aspect_ratio": aspect_ratio,
-                "quality": quality,
-                "jobId": job_id,
-            },
         }
 
     except Exception as e:
-        print(f"Job failed: {job_id}: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-        }
+        log(f"Job failed: {job_id}: {e}")
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
 
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+log("BOOT: starting RunPod serverless worker")
 runpod.serverless.start({"handler": handler})
