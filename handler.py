@@ -178,6 +178,7 @@ def get_pipeline():
 
 
 def generate_video(prompt: str, image, output_path: str, duration: int, aspect_ratio: str, quality: str):
+    import inspect
     import torch
     from diffusers.utils import export_to_video
 
@@ -203,21 +204,29 @@ def generate_video(prompt: str, image, output_path: str, duration: int, aspect_r
         f"duration_requested={duration}s, fps={fps}, steps={steps}, quality={quality}"
     )
 
+    pipe_kwargs = {
+        "image": image,
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "width": width,
+        "height": height,
+        "num_frames": num_frames,
+        "num_inference_steps": steps,
+        "guidance_scale": 5.0 if quality == "high" else 3.5,
+        "guidance_rescale": 0.7,
+        "generator": generator,
+        "decode_timestep": 0.05 if quality == "high" else 0.03,
+        "decode_noise_scale": 0.025,
+        "image_cond_noise_scale": 0.025,
+    }
+
+    supported_args = set(inspect.signature(pipe.__call__).parameters.keys())
+    pipe_kwargs = {key: value for key, value in pipe_kwargs.items() if key in supported_args}
+
+    log(f"LTX supported args used: {sorted(pipe_kwargs.keys())}")
+
     with torch.inference_mode():
-        result = pipe(
-            image=image,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=width,
-            height=height,
-            num_frames=num_frames,
-            num_inference_steps=steps,
-            guidance_scale=5.0 if quality == "high" else 3.5,
-            image_cond_noise_scale=0.025,
-            generator=generator,
-            decode_timestep=0.05 if quality == "high" else 0.03,
-            decode_noise_scale=0.025,
-        )
+        result = pipe(**pipe_kwargs)
 
     export_to_video(result.frames[0], output_path, fps=fps)
 
@@ -225,6 +234,7 @@ def generate_video(prompt: str, image, output_path: str, duration: int, aspect_r
         torch.cuda.empty_cache()
 
     return output_path
+
 
 
 def handler(job):
