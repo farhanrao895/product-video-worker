@@ -1,25 +1,25 @@
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
 
 WORKDIR /app
 
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
+ENV HF_HOME=/runpod-volume/huggingface-cache
+ENV HUGGINGFACE_HUB_CACHE=/runpod-volume/huggingface-cache/hub
+ENV TRANSFORMERS_CACHE=/runpod-volume/huggingface-cache/transformers
 ENV HF_HUB_ENABLE_HF_TRANSFER=1
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
     git \
     wget \
     curl \
     ffmpeg \
-    libgl1 \
-    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-
-RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY handler.py .
 
-CMD ["python", "-u", "handler.py"]
+CMD ["python", "handler.py"]
